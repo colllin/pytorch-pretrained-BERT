@@ -115,8 +115,12 @@ class GPT2Config(object):
         n_embd=768,
         n_layer=12,
         n_head=12,
+        resid_pdrop=0.1,
+        embd_pdrop=0.1,
+        attn_pdrop=0.1,
         layer_norm_epsilon=1e-5,
         initializer_range=0.02,
+        n_embed_categories=0,
     ):
         """Constructs GPT2Config.
 
@@ -145,8 +149,12 @@ class GPT2Config(object):
             self.n_embd = n_embd
             self.n_layer = n_layer
             self.n_head = n_head
+            self.resid_pdrop = resid_pdrop
+            self.embd_pdrop = embd_pdrop
+            self.attn_pdrop = attn_pdrop
             self.layer_norm_epsilon = layer_norm_epsilon
             self.initializer_range = initializer_range
+            self.n_embed_categories = n_embed_categories
         else:
             raise ValueError(
                 "First argument must be either a vocabulary size (int)"
@@ -209,6 +217,8 @@ class Attention(nn.Module):
         self.scale = scale
         self.c_attn = Conv1D(n_state * 3, nx)
         self.c_proj = Conv1D(n_state, nx)
+        self.attn_dropout = nn.Dropout(config.attn_pdrop)
+        self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
     def _attn(self, q, k, v):
         w = torch.matmul(q, k)
@@ -219,6 +229,7 @@ class Attention(nn.Module):
         w = w * b - 1e10 * (1 - b)
 
         w = nn.Softmax(dim=-1)(w)
+        w = self.attn_dropout(w)
         return torch.matmul(w, v)
 
     def merge_heads(self, x):
@@ -248,6 +259,7 @@ class Attention(nn.Module):
         a = self._attn(query, key, value)
         a = self.merge_heads(a)
         a = self.c_proj(a)
+        a = self.resid_dropout(a)
         return a, present
 
 
@@ -258,11 +270,12 @@ class MLP(nn.Module):
         self.c_fc = Conv1D(n_state, nx)
         self.c_proj = Conv1D(nx, n_state)
         self.act = gelu
+        self.dropout = nn.Dropout(config.resid_pdrop)
 
     def forward(self, x):
         h = self.act(self.c_fc(x))
         h2 = self.c_proj(h)
-        return h2
+        return self.dropout(h2)
 
 
 class Block(nn.Module):
@@ -308,20 +321,28 @@ class GPT2MultipleChoiceHead(nn.Module):
     def __init__(self, config):
         super(GPT2MultipleChoiceHead, self).__init__()
         self.n_embd = config.n_embd
-        self.linear = nn.Linear(config.n_embd, 1)
+        # self.linear = nn.Linear(config.n_embd, 1)
+        self.linear = nn.Linear(config.n_embd, config.n_embed_categories)
+        self.n_choices = config.n_embed_categories
 
         nn.init.normal_(self.linear.weight, std=0.02)
         nn.init.normal_(self.linear.bias, 0)
 
     def forward(self, hidden_states, mc_token_ids):
+        # # Classification logits
+        # # hidden_state (bsz, num_choices, seq_length, hidden_size)
+        # # mc_token_ids (bsz, num_choices)
+        # mc_token_ids = mc_token_ids.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, hidden_states.size(-1))
+        # # (bsz, num_choices, 1, hidden_size)
+        # multiple_choice_h = hidden_states.gather(2, mc_token_ids).squeeze(2)
+        # # (bsz, num_choices, hidden_size)
+        # multiple_choice_logits = self.linear(multiple_choice_h).squeeze(-1)
+        # # (bsz, num_choices)
         # Classification logits
-        # hidden_state (bsz, num_choices, seq_length, hidden_size)
-        # mc_token_ids (bsz, num_choices)
-        mc_token_ids = mc_token_ids.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, hidden_states.size(-1))
-        # (bsz, num_choices, 1, hidden_size)
-        multiple_choice_h = hidden_states.gather(2, mc_token_ids).squeeze(2)
-        # (bsz, num_choices, hidden_size)
-        multiple_choice_logits = self.linear(multiple_choice_h).squeeze(-1)
+        # hidden_state (bsz, seq_length, hidden_size)
+        multiple_choice_h = hidden_states[:,-1,-self.n_choices:]
+        # (bsz, num_choices)
+        multiple_choice_logits = self.linear(multiple_choice_h)
         # (bsz, num_choices)
         return multiple_choice_logits
 
@@ -521,6 +542,7 @@ class GPT2Model(GPT2PreTrainedModel):
         super(GPT2Model, self).__init__(config)
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.wpe = nn.Embedding(config.n_positions, config.n_embd)
+        self.dropout = nn.Dropout(config.embd_pdrop)
         block = Block(config.n_ctx, config, scale=True)
         self.h = nn.ModuleList([copy.deepcopy(block) for _ in range(config.n_layer)])
         self.ln_f = LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
@@ -528,27 +550,35 @@ class GPT2Model(GPT2PreTrainedModel):
         self.apply(self.init_weights)
 
     def forward(self, input_ids, position_ids=None, token_type_ids=None, past=None):
+        input_is_embedded = input_ids.dim() > 2
+        B, L, *_ = input_ids.shape
         if past is None:
             past_length = 0
             past = [None] * len(self.h)
         else:
             past_length = past[0][0].size(-2)
         if position_ids is None:
-            position_ids = torch.arange(past_length, input_ids.size(-1) + past_length, dtype=torch.long, device=input_ids.device)
-            position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+            position_ids = torch.arange(past_length, L + past_length, dtype=torch.long, device=input_ids.device)
+            position_ids = position_ids.unsqueeze(0).expand([B, L])
 
-        input_shape = input_ids.size()
-        input_ids = input_ids.view(-1, input_ids.size(-1))
+        input_shape = input_ids.shape[:2]
+
+        if input_is_embedded:
+            inputs_embeds = input_ids
+        else:
+            input_ids = input_ids.view(-1, input_ids.size(-1))
+            inputs_embeds = self.wte(input_ids)
+
         position_ids = position_ids.view(-1, position_ids.size(-1))
-
-        inputs_embeds = self.wte(input_ids)
         position_embeds = self.wpe(position_ids)
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, token_type_ids.size(-1))
             token_type_embeds = self.wte(token_type_ids)
         else:
             token_type_embeds = 0
+
         hidden_states = inputs_embeds + position_embeds + token_type_embeds
+        hidden_states = self.dropout(hidden_states)
         presents = []
         for block, layer_past in zip(self.h, past):
             hidden_states, present = block(hidden_states, layer_past)
@@ -615,12 +645,14 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
     def forward(self, input_ids, position_ids=None, token_type_ids=None, lm_labels=None, past=None):
         hidden_states, presents = self.transformer(input_ids, position_ids, token_type_ids, past)
-        lm_logits = self.lm_head(hidden_states)
+        # lm_logits = self.lm_head(hidden_states)
+        lm_logits = hidden_states
         if lm_labels is not None:
-            loss_fct = CrossEntropyLoss(ignore_index=-1)
-            loss = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), lm_labels.view(-1))
-            return loss
-        return lm_logits, presents
+            # loss_fct = CrossEntropyLoss(ignore_index=-1)
+            # loss = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), lm_labels.view(-1))
+            loss = (lm_labels - lm_logits).norm()
+            return lm_logits, loss
+        return lm_logits#, presents
 
 
 class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
